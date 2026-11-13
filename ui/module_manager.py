@@ -379,23 +379,27 @@ class ImgtransThread(QThread):
             need_save_mask = False
             blk_removed: List[TextBlock] = []
             if enable_detect:
+                detect_ok = True
                 try:
                     mask, blk_list = self.textdetector.detect(img, self.imgtrans_proj)
                     need_save_mask = True
                 except Exception as e:
                     create_error_dialog(e, self.tr('Text Detection Failed.'), 'TextDetectFailed')
-                    blk_list = []
+                    detect_ok = False
+                    blk_list = None
                 self.detect_counter += 1
-                if pcfg.module.keep_exist_textlines:
-                    blk_list = self.imgtrans_proj.pages[imgname] + blk_list
-                    blk_list = sort_regions(blk_list)
-                    existed_mask = self.imgtrans_proj.load_mask_by_imgname(imgname)
-                    if existed_mask is not None:
-                        # 修复：如果尺寸不一致，使用当前图像尺寸重新调整 existed_mask
-                        if existed_mask.shape != mask.shape:
-                            existed_mask = cv2.resize(existed_mask, (mask.shape[1], mask.shape[0]))
-                        mask = np.bitwise_or(mask, existed_mask)
-                self.imgtrans_proj.pages[imgname] = blk_list
+                # 仅在检测成功时覆盖；失败时保留该页原有文字块，避免数据丢失
+                if detect_ok:
+                    if pcfg.module.keep_exist_textlines:
+                        blk_list = self.imgtrans_proj.pages[imgname] + blk_list
+                        blk_list = sort_regions(blk_list)
+                        existed_mask = self.imgtrans_proj.load_mask_by_imgname(imgname)
+                        if existed_mask is not None:
+                            # 修复：如果尺寸不一致，使用当前图像尺寸重新调整 existed_mask
+                            if existed_mask.shape != mask.shape:
+                                existed_mask = cv2.resize(existed_mask, (mask.shape[1], mask.shape[0]))
+                            mask = np.bitwise_or(mask, existed_mask)
+                    self.imgtrans_proj.pages[imgname] = blk_list
 
                 if mask is not None and not enable_ocr:
                     self.imgtrans_proj.save_mask(imgname, mask)
@@ -404,7 +408,8 @@ class ImgtransThread(QThread):
                 self.update_detect_progress.emit(self.detect_counter)
 
             if blk_list is None:
-                blk_list = self.imgtrans_proj.pages[imgname] if imgname in self.imgtrans_proj.pages else []
+                # 检测失败时 blk_list 为 None：退回该页已有文字块，避免下游拿到 None 报错
+                blk_list = self.imgtrans_proj.pages.get(imgname) or []
 
             if enable_ocr:
                 try:

@@ -2,9 +2,9 @@ import copy
 import sys
 from typing import List
 
-from qtpy.QtWidgets import QLineEdit, QSizePolicy, QHBoxLayout, QVBoxLayout, QFrame, QFontComboBox, QApplication, QPushButton, QLabel, QGroupBox, QCheckBox, QSlider, QDoubleSpinBox, QWidget
-from qtpy.QtCore import Signal, Qt
-from qtpy.QtGui import QFocusEvent, QMouseEvent, QTextCursor, QKeyEvent
+from qtpy.QtWidgets import QLineEdit, QSizePolicy, QHBoxLayout, QVBoxLayout, QFrame, QApplication, QPushButton, QLabel, QGroupBox, QCheckBox, QSlider, QDoubleSpinBox, QWidget
+from qtpy.QtCore import Signal, Qt, QPoint
+from qtpy.QtGui import QFocusEvent, QMouseEvent, QTextCursor, QKeyEvent, QFont, QFontMetrics, QPainter, QPen, QBrush, QColor, QPolygon
 
 from utils import shared
 from utils import config as C
@@ -13,37 +13,8 @@ from .custom_widget import Widget, ColorPickerLabel, SmallColorPickerLabel, Clic
 from .textitem import TextBlkItem
 from .text_advanced_format import TextAdvancedFormatPanel
 from .text_style_presets import TextStylePresetPanel
+from .font_picker import FontPickerPopup
 from . import funcmaps as FM
-
-
-class LineEdit(QLineEdit):
-
-    return_pressed_wochange = Signal()
-    return_pressed = Signal()
-
-    def __init__(self, content: str = None, parent = None):
-        super().__init__(content, parent)
-        self.textChanged.connect(self.on_text_changed)
-        self._text_changed = False
-        self.editingFinished.connect(self.on_editing_finished)
-        # self.returnPressed.connect(self.on_return_pressed)
-
-    def on_text_changed(self):
-        self._text_changed = True
-
-    def on_editing_finished(self):
-        self._text_changed = False
-
-    def focusOutEvent(self, e: QFocusEvent) -> None:
-        self._text_changed = False
-        return super().focusOutEvent(e)
-
-    def keyPressEvent(self, e: QKeyEvent) -> None:
-        super().keyPressEvent(e)
-        if e.key() == Qt.Key.Key_Return:
-            self.return_pressed.emit()
-            if not self._text_changed:
-                self.return_pressed_wochange.emit()
 
 
 class IncrementalBtn(QPushButton):
@@ -207,39 +178,147 @@ class FontSizeBox(QFrame):
                 self.fcombobox.setCurrentText(str(newsize)+"+")
     
 
-class FontFamilyComboBox(QFontComboBox):
+class FontFamilyComboBox(QWidget):
+    """现代字体选择器：点击弹出带搜索(模糊/拼音/最近使用)的字体列表。
+
+    保留原有公开接口: currentText / setCurrentText / update_font_list / param_changed
+    """
+
     param_changed = Signal(str, object)
+
     def __init__(self, emit_if_focused=True, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.currentFontChanged.connect(self.on_fontfamily_changed)
-        self.lineedit = lineedit = LineEdit(parent=self)
-        lineedit.return_pressed.connect(self.on_return_pressed)
-        self.setLineEdit(lineedit)
         self.emit_if_focused = emit_if_focused
-        self.return_pressed = False
-        
-    def apply_fontfamily(self):
-        ffamily = self.currentFont().family()
-        self.param_changed.emit('font_family', ffamily)
+        self._current_font = shared.DEFAULT_FONT_FAMILY
+        self._font_list: List[str] = []
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(28)
+        self.setMinimumWidth(120)
+        self.setObjectName("FontFamilyBox")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(self.tr("Click to choose font"))
+
+        self._popup: FontPickerPopup = None
+
+    # ── 公开接口（与原 QFontComboBox 行为一致）──────────────────────
+
+    def currentText(self) -> str:
+        return self._current_font
+
+    def setCurrentText(self, family: str):
+        if family and family != self._current_font:
+            self._current_font = family
+            self.update()
 
     def update_font_list(self, font_list):
-        self.currentFontChanged.disconnect(self.on_fontfamily_changed)
-        current_font = self.currentFont().family()
-        self.clear()
-        self.addItems(font_list)
-        self.addItems([current_font])
-        self.setCurrentText(current_font)
-        self.currentFontChanged.connect(self.on_fontfamily_changed)
+        self._font_list = sorted(font_list, key=lambda s: s.lower())
+        if self._current_font not in self._font_list and self._font_list:
+            # 保持当前字体可见（附加到列表供搜索）
+            self._font_list.append(self._current_font)
 
-    def on_return_pressed(self):
-        self.return_pressed = True
-        self.apply_fontfamily()
+    def blockSignals(self, block: bool):
+        # 兼容原调用点（set_active_format 中成对调用），本控件无需真正阻塞
+        return super().blockSignals(block)
 
-    def on_fontfamily_changed(self):
-        if self.return_pressed:
-            self.return_pressed = False
-        else:
-            self.apply_fontfamily()
+    # ── 交互 ───────────────────────────────────────────────────────
+
+    def mousePressEvent(self, e: QMouseEvent):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._open_popup()
+
+    def _open_popup(self):
+        # 弹窗已打开时，点击字体栏 = 收起（不重新弹出）
+        if self._popup is not None and self._popup.isVisible():
+            self._popup.close()
+            return
+        # 清理上一次已关闭的弹窗对象，避免反复点击累积隐藏窗口
+        if self._popup is not None:
+            self._popup.deleteLater()
+            self._popup = None
+
+        from utils import config as _cfg
+        recent = list(getattr(_cfg.pcfg, 'recent_fonts', []) or [])
+        self._popup = FontPickerPopup(self._font_list, recent=recent, parent=self,
+                                      current_font=self._current_font)
+        self._popup.font_selected.connect(self._on_font_selected)
+        # 弹窗定位到控件下方（下方空间不足则放到上方）
+        from qtpy.QtGui import QGuiApplication
+        gp = self.mapToGlobal(self.rect().bottomLeft())
+        scr = QGuiApplication.screenAt(gp)
+        if scr is not None:
+            avail = scr.availableGeometry()
+            if gp.y() + self._popup.height() > avail.bottom():
+                above = self.mapToGlobal(self.rect().topLeft())
+                gp.setY(max(avail.top(), above.y() - self._popup.height()))
+        self._popup.move(gp)
+        self._popup.show()
+        self._popup.raise_()
+        self._popup.activateWindow()
+
+    def _on_font_selected(self, family: str):
+        if not family:
+            return
+        self._current_font = family
+        self._remember_recent(family)
+        self.update()
+        if self.emit_if_focused:
+            self.param_changed.emit('font_family', family)
+
+    @staticmethod
+    def _remember_recent(family: str):
+        from utils import config as _cfg
+        recent = list(getattr(_cfg.pcfg, 'recent_fonts', []) or [])
+        recent = [f for f in recent if f != family]
+        recent.insert(0, family)
+        _cfg.pcfg.recent_fonts = recent[:10]
+
+    # ── 自绘 ───────────────────────────────────────────────────────
+
+    def paintEvent(self, e):
+        from .custom_widget import isDarkTheme
+        dark = isDarkTheme()
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        # 边框 + 背景
+        border = QColor(30, 147, 229) if self.underMouse() else \
+            (QColor(83, 86, 113) if dark else QColor(160, 160, 160))
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, 4, 4)
+
+        # 当前字体名（用该字体自身渲染）
+        text_rect = rect.adjusted(8, 0, -24, 0)
+        font = QFont(self._current_font)
+        font.setPointSize(11)
+        font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        painter.setFont(font)
+        painter.setPen(QColor(*shared.FOREGROUND_FONTCOLOR))
+        fm = QFontMetrics(font)
+        elided = fm.elidedText(self._current_font, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+
+        # 下拉箭头
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(200, 200, 200) if dark else QColor(120, 120, 120)))
+        cx = rect.right() - 12
+        cy = rect.center().y()
+        from qtpy.QtGui import QPolygon
+        arrow = QPolygon([
+            QPoint(int(cx - 4), int(cy - 2)),
+            QPoint(int(cx + 4), int(cy - 2)),
+            QPoint(int(cx), int(cy + 3)),
+        ])
+        painter.drawPolygon(arrow)
+
+    def enterEvent(self, e):
+        self.update()
+
+    def leaveEvent(self, e):
+        self.update()
 
 
 class FontFormatPanel(Widget):
@@ -261,6 +340,10 @@ class FontFormatPanel(Widget):
         self.familybox.setToolTip(self.tr("Font Family"))
         self.familybox.param_changed.connect(self.on_param_changed)
         self.familybox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # 初始化字体列表（原 QFontComboBox 自带字体库，这里用全局字体集）
+        _fonts = shared.CUSTOM_FONTS if (C.pcfg.let_show_only_custom_fonts_flag and shared.CUSTOM_FONTS) else shared.FONT_FAMILIES
+        if _fonts:
+            self.familybox.update_font_list(_fonts)
 
         self.fontsizebox = FontSizeBox(self)
         self.fontsizebox.setToolTip(self.tr("Font Size"))
